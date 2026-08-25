@@ -12,6 +12,7 @@ Subcommands:
   latigo send <agent> <text>            send a message and verify it landed
   latigo board <add|take|done|release|blocked|list|show|pending>
   latigo deploy [-n N] [--kind KIND]    fill the project's panes with workers
+  latigo init [--dry]                   start a project with the rules in place
 
 Project root resolution: --dir PATH > $LATIGO_ROOT > git root of cwd > cwd.
 State lives in <root>/.latigo/ (board, logs, config).
@@ -465,6 +466,90 @@ def _sweep_once(root, base, state, dry, grace, cooldown):
                   % (name, detail, ident), file=sys.stderr)
 
 
+def templates_dir():
+    """Resolved from where this script LIVES, not from the caller's cwd.
+
+    A hardcoded path makes the tool useless on another machine and silently
+    wrong on this one the day the checkout moves. `realpath` also resolves the
+    symlink this is usually installed as.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.join(os.path.dirname(here), "templates")
+
+
+def cmd_init(root, argv):
+    """Start a project with the rules already in place.
+
+    A new project should not have to rediscover what the last one paid for, and
+    a new worker should not have to be taught the house rules by hand. `init`
+    writes them down once, where the fleet actually reads them.
+
+    Nothing is ever overwritten: existing files are reported and left alone.
+    """
+    dry = "--dry" in argv
+    base = os.path.join(root, ".latigo")
+    tpl = templates_dir()
+
+    plan = [
+        (os.path.join(base, "rules.md"), os.path.join(tpl, "rules.md"),
+         "house rules, appended to every request handed out"),
+        (os.path.join(base, "LESSONS.md"), os.path.join(tpl, "LESSONS.md"),
+         "mistakes not to repeat; add to it whenever something costs an hour"),
+        (os.path.join(base, "BOSS.md"), os.path.join(tpl, "BOSS.md"),
+         "the boss role: keeping the board stocked is the job"),
+        (os.path.join(base, "no-whip.conf"), None,
+         "panes that must never be whipped"),
+        (os.path.join(base, "adopted-panes.conf"), None,
+         "workers of this project whose cwd is elsewhere"),
+        (os.path.join(base, "roles.conf"), None,
+         "who is the boss, who is the owner"),
+    ]
+    inline = {
+        "no-whip.conf": ("# Panes or agent names never to whip. One per line, "
+                         "# comments.\n"
+                         "# A manual override only: the worker-kind filter is the real\n"
+                         "# defence, and it does not go stale when ids change.\n"
+                         "boss\n"),
+        "adopted-panes.conf": ("# Workers of this project whose shell started somewhere else.\n"
+                               "# They are not idle by choice, they are invisible: the cwd filter\n"
+                               "# never considers them. Adopting beats restarting, which throws\n"
+                               "# away the session. Keep these lists disjoint between projects.\n"),
+        "roles.conf": ("# role=agent-name-or-pane\n"
+                       "# The boss orchestrates and keeps the board stocked.\n"
+                       "# The owner is a human: notices go to a file, never to their terminal.\n"
+                       "boss=boss\n"
+                       "# owner=w1:p1\n"),
+    }
+
+    if not dry:
+        os.makedirs(os.path.join(base, "items"), exist_ok=True)
+
+    for dest, src, what in plan:
+        name = os.path.basename(dest)
+        if os.path.exists(dest):
+            print("kept     .latigo/%-20s (already there)" % name)
+            continue
+        if dry:
+            print("would    .latigo/%-20s %s" % (name, what))
+            continue
+        if src and os.path.exists(src):
+            with open(src, encoding="utf-8") as fh:
+                body = fh.read()
+        else:
+            body = inline.get(name, "")
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        print("wrote    .latigo/%-20s %s" % (name, what))
+
+    if not dry:
+        print("\nThe board is empty, which means nobody will be given anything "
+              "to do yet.\nThat is the boss's job:\n"
+              "  latigo board add \"<title>\\n\\nZone: ...\\nDone when: ...\"\n"
+              "  latigo deploy -n 6\n"
+              "  latigo sweep --loop 120")
+    return 0
+
+
 def cmd_send(root, argv):
     if len(argv) < 2:
         sys.exit('usage: latigo send <agent> "<text>"')
@@ -530,12 +615,12 @@ def main():
     root = root_of(argv)
     cmd, rest = argv[0], argv[1:]
 
-    if cmd != "board" and os.environ.get("HERDR_ENV") != "1":
+    if cmd not in ("board", "init") and os.environ.get("HERDR_ENV") != "1":
         print("latigo: not inside a Herdr session (HERDR_ENV != 1)", file=sys.stderr)
         return 3
 
     table = {"sweep": cmd_sweep, "roster": cmd_roster, "send": cmd_send,
-             "board": cmd_board, "deploy": cmd_deploy}
+             "board": cmd_board, "deploy": cmd_deploy, "init": cmd_init}
     if cmd not in table:
         print("latigo: unknown command '%s' (try latigo --help)" % cmd, file=sys.stderr)
         return 2

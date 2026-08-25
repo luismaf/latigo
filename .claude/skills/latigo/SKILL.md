@@ -43,6 +43,7 @@ These are not style preferences. Each one comes from a fleet breaking.
 ## Normal flow
 
 ```bash
+latigo init                        # first: the house rules and lessons, once
 latigo deploy -n 6                  # adopt unnamed workers, add tabs up to 6
 latigo board add "$(cat request.md)"   # work goes in as files, one per item
 latigo sweep                        # one pass
@@ -53,6 +54,21 @@ latigo send dev3 "read and execute .latigo/items/IT-007.md"
 ```
 
 Run `latigo sweep --dry` first when unsure: it reports what it *would* do.
+
+## Starting a project
+
+Run `latigo init` before anything else. It writes `rules.md` (attached to every
+request the fleet hands out), `LESSONS.md` (mistakes not to repeat) and
+`BOSS.md`. The rules it installs are the working standard, and they hold whether
+or not the tool is in play:
+
+- A build is not progress; a test run is not progress. Never use either to look
+  busy — having nothing to do is a sentence you are allowed to say.
+- Verify cheaply first: read the code, type-check what you touched, one targeted
+  test, look at the running app. One machine, one build at a time.
+- Only work that moves the project toward its objective counts.
+- English everywhere — code, comments, identifiers, commits, docs.
+- 99% code, 1% prose. Prolific and professional.
 
 ## Supervising, not just whipping
 

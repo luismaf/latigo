@@ -80,6 +80,9 @@ ln -s ~/src/latigo/bin/latigo ~/.local/bin/latigo   # anywhere on your PATH
 Everything lives in `<project>/.latigo/`. Run it from inside a Herdr pane.
 
 ```bash
+# 0. start the project with the rules already in place (safe to re-run)
+latigo init
+
 # 1. put workers in the project's panes (adopts unnamed ones, adds tabs to reach -n)
 latigo deploy -n 6
 
@@ -102,6 +105,7 @@ latigo board list
 
 | Command | What it does |
 |---|---|
+| `latigo init [--dry]` | Start a project with the house rules, the lessons file and the boss guide already written. Never overwrites. |
 | `latigo sweep [--loop [SEC]] [--dry]` | One pass over the fleet, or a loop. `--dry` reports without sending. |
 | `latigo roster` | The fleet: name, pane, kind, status, whether it counts as this project's. |
 | `latigo send <agent> <text>` | Send a message and verify it landed. Useful on its own. |
@@ -118,6 +122,33 @@ root of the current directory, then the current directory.
 | `no-whip.conf` | Panes or agent names that must never be whipped. One per line, `#` comments. A manual override; the worker-kind filter is the real defence. |
 | `adopted-panes.conf` | Panes that belong to this project despite a different `cwd`. They get an absolute `cd` prefixed to every request, or relative paths would resolve elsewhere and fail silently. Keep these lists **disjoint** between projects: a pane in two lists receives two items and loses one. |
 | `rules.md` | House rules appended to every whip. Standing rules belong in a file, not hardcoded in the tool. |
+
+## What a project starts with
+
+`latigo init` is the point where a project inherits what the last one learned,
+instead of rediscovering it. It writes three files:
+
+- **`rules.md`** — appended verbatim to every request the fleet hands out, so the
+  rules travel with the work instead of sitting in a document nobody opens. What
+  is in there matters more than the tool:
+  - **A build is not progress. A test run is not progress.** They are
+    instruments. Nobody is paying for a compiler to be exercised.
+  - **Never fill time with a build or a test suite to look busy.** Having nothing
+    to do is a sentence you are allowed to say. Invented work costs money, burns
+    the machine, and creates review load for someone else.
+  - Verify the cheap way first: read the code, check the types of what you
+    touched, run one targeted test, look at the running app.
+  - **One machine, one build at a time.** Two link steps at once is not slower,
+    it is a freeze — and somebody is sitting in front of that machine.
+  - Only work that moves the project toward its objective counts.
+  - English everywhere; 99% code, 1% prose; prolific and professional.
+- **`LESSONS.md`** — the mistakes not to repeat, each one already paid for. Add
+  to it whenever something costs you an hour. That is what it is for.
+- **`BOSS.md`** — the boss role. Its first line is the one that matters: an empty
+  board means every worker is silent, the whip does not invent work, so keeping
+  the board stocked *is* the job.
+
+Re-running `init` never overwrites: existing files are reported and left alone.
 
 ## The board
 
