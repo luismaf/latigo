@@ -1,12 +1,15 @@
 # latigo
 
+*A supervisor for fleets of terminal coding agents: hands out the work, checks it landed, and knows when to shut up.*
+
 **Keep a fleet of terminal coding agents working.**
 
 [Herdr](https://herdr.dev) puts coding agents into terminal panes and tells you
 what each one is doing. It does not decide *who works on what*. That gap is
 where fleets die: a pane finishes, goes idle, and stays idle until a human
 notices. With a dozen panes, the human is the bottleneck — and idle panes are
-the most expensive failure in the whole setup.
+the most expensive failure in the whole setup. They are also the quietest, which
+is why they last so long.
 
 `latigo` (Spanish for *whip*) is the missing supervisor:
 
@@ -31,21 +34,22 @@ Three ways a naive whip destroys a fleet, all of them observed in production:
 
 | Failure | What happens | What `latigo` does |
 |---|---|---|
-| **It whips the humans** | `herdr agent list` returns *every* pane, including the one where a person is having a conversation with an assistant. It gets an automated "why are you idle" — mid-sentence, and billed to them. | Only panes running the **worker kind** (`opencode` by default) are workers. A `claude` pane is a conversation, never a worker. This invariant survives panes being renumbered and roles renamed; id-based exclusion lists do not. |
+| **It whips the humans** | `herdr agent list` returns *every* pane, including the one where a person is having a conversation with an assistant. It gets an automated "why are you idle" — mid-sentence, and billed to them. They rarely find it motivating. | Only panes running the **worker kind** (`opencode` by default) are workers. A `claude` pane is a conversation, never a worker. This invariant survives panes being renumbered and roles renamed; id-based exclusion lists do not. |
 | **It whips other projects** | No `cwd` filter, so panes working on unrelated repos get handed this project's tickets. | A worker must have its `cwd` at the project root, or be explicitly adopted in `adopted-panes.conf`. |
 | **It hands the same item to everyone** | Reading the first pending row without claiming it means a sweep that finds four idle panes tells all four to do the same ticket. Four panes colliding on one file is worse than four idle panes. | The item is claimed atomically through `latigo board take` before it is ever named in a message. |
 
 And two that come from the terminal itself:
 
 - **Sending a message is two calls, and the second one fails.** The text can sit
-  typed in the agent's prompt box, unsent, forever. `latigo send` uses
-  `--wait --until working`, so it returns only when the agent actually started;
+  typed in the agent's prompt box, unsent, for as long as you let it — agents are
+  patient that way. `latigo send` uses `--wait --until working`, so it returns
+  only when the agent actually started;
   otherwise it retries with focus + Enter, and if *that* fails it **reads the
   pane and stops**. A pane stuck in a menu goes deeper with every extra Enter —
   it needs `esc`, not persistence.
 - **Status lies in both directions.** A pane between two tool calls reads as
-  `idle`; a pane that crashed can read as `done`. Which is why nothing here
-  trusts a single status read.
+  `idle`; a pane that crashed can read as `done`. Which is why nothing here trusts a
+  single status read, and neither should you.
 
 ## The three valves
 
@@ -59,12 +63,12 @@ inventing work to look busy:
   ceiling on spend per pane.
 - **SILENCE** — empty board means everyone is left alone, with a single notice.
   A quiet worker with everything done is the correct state, not a fault to be
-  corrected with messages.
+  corrected with messages. Ask any employee.
 
 ## Install
 
 Requires `python3`, `git`, and [Herdr](https://herdr.dev) on `PATH`. No
-libraries, no daemon, no database.
+libraries, no daemon, no database, no service to keep alive at 3am.
 
 ```bash
 git clone <this-repo> ~/src/latigo
@@ -135,14 +139,17 @@ Two properties worth knowing:
   rest of the queue is never read. `take` picks the pending item with the *fewest
   attempts*, oldest first. After `ATTEMPT_CAP` bounces an item is marked
   `blocked` and stops circulating — an item nobody can close would otherwise
-  recirculate forever, and every lap costs a prompt.
+  recirculate forever, and every lap costs a prompt. The queue develops opinions
+  about that ticket long before you do.
 
 ## What it deliberately does not do
 
-- It does not invent work. An empty board means silence.
+- It does not invent work. An empty board means silence, not busywork dressed up
+  as a refactor.
 - It does not write to your repo, run your build, or commit anything.
 - It does not answer dialogs. A pane waiting on an approval prompt is reported,
-  not clicked through — read it and decide yourself.
+  not clicked through — read it and decide yourself. Nothing here should be
+  allowed to say yes on your behalf.
 
 ## License
 
