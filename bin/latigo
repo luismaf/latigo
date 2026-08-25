@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""latigo — keep a fleet of Herdr coding agents working.
+
+Herdr (https://herdr.dev) puts coding agents in terminal panes. It does not
+decide who works on what. `latigo` ("the whip") is the missing supervisor: it
+finds the panes that went idle, claims a work item for each one, and hands it
+over — verifying the message actually landed.
+
+Subcommands:
+  latigo sweep [--loop [SEC]] [--dry]   one pass over the fleet (or a loop)
+  latigo roster                         list the fleet with status and cwd
+  latigo send <agent> <text>            send a message and verify it landed
+  latigo board <add|take|done|release|blocked|list|show|pending>
+  latigo deploy [-n N] [--kind KIND]    fill the project's panes with workers
+
+Project root resolution: --dir PATH > $LATIGO_ROOT > git root of cwd > cwd.
+State lives in <root>/.latigo/ (board, logs, config).
+
+Every rule in this file was paid for with an incident. See docs/METHOD.md.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+GRACE = 90          # seconds a pane must sit idle before it is pushed
+COOLDOWN = 900      # seconds between two whips to the same pane
+INTERVAL = 120      # seconds between sweeps in --loop mode
+ATTEMPT_CAP = 3     # times an item may bounce before it is marked blocked
+WORKER_KIND = "opencode"
+
+
+# --------------------------------------------------------------------------
+# plumbing
+# --------------------------------------------------------------------------
+
+def sh(args, timeout=60):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as exc:                                # noqa: BLE001
+        return 1, "", str(exc)
+
+
+def root_of(argv):
+    if "--dir" in argv:
+        i = argv.index("--dir")
+        path = argv[i + 1]
+        del argv[i:i + 2]
+        return os.path.realpath(path)
+    if os.environ.get("LATIGO_ROOT"):
+        return os.path.realpath(os.environ["LATIGO_ROOT"])
+    _, out, _ = sh(["git", "rev-parse", "--show-toplevel"], timeout=10)
+    return os.path.realpath(out.strip()) if out.strip() else os.path.realpath(os.getcwd())
+
+
+def home(root):
+    d = os.path.join(root, ".latigo")
+    os.makedirs(os.path.join(d, "items"), exist_ok=True)
+    return d
+
+
+def conf_list(path):
+    """One value per line, `#` starts a comment."""
+    if not os.path.exists(path):
+        return set()
+    out = set()
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                out.add(line)
+    return out
+
+
+class Lock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.fh = open(self.path, "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+# --------------------------------------------------------------------------
+# herdr
+# --------------------------------------------------------------------------
+
+def agents():
+    code, out, _ = sh(["herdr", "agent", "list"])
+    if code != 0:
+        return []
+    try:
+        return json.loads(out).get("result", {}).get("agents", [])
+    except Exception:                                       # noqa: BLE001
+        return []
+
+
+
+def screen(target, lines=None):
+    args = ["herdr", "agent", "read", target, "--source", "visible"]
+    if lines:
+        args += ["--lines", str(lines)]
+    return sh(args)[1]
+
+
+def send(target, text, timeout_ms=20000):
+    """Send a message to an agent and verify it actually started working.
+
+    Sending is TWO calls, and the second one is the one that fails: herdr can
+    leave the text typed in the agent's prompt box without submitting it. The
+    pane then sits there forever and nobody notices until someone walks past.
+
+    Order, from the Herdr manual:
+      1. prompt --wait --until working   — returns only if the message landed
+      2. focus + enter                   — without focus the Enter may not submit
+      3. read the pane and STOP          — a pane stuck in a menu goes DEEPER
+                                           with every extra Enter; it needs esc
+
+    Returns (ok: bool, detail: str).
+    """
+    code, _, err = sh(["herdr", "agent", "prompt", target, text,
+                       "--wait", "--until", "working",
+                       "--timeout", str(timeout_ms)], timeout=timeout_ms / 1000 + 30)
+    if code == 0:
+        return True, "landed"
+    if "agent_blocked" in err:
+        return False, "blocked: the pane is waiting on a dialog, look before answering"
+
+    sh(["herdr", "agent", "focus", target])
+    sh(["herdr", "agent", "send-keys", target, "enter"])
+    code, _, _ = sh(["herdr", "agent", "wait", target,
+                     "--until", "working", "--timeout", "8000"], timeout=40)
+    if code == 0:
+        return True, "landed after focus+enter"
+
+    # Never insist blindly. Look at what is on screen instead.
+    return False, "did not start; screen says:\n" + tail(screen(target, 15), 8)
+
+
+def tail(text, n):
+    lines = [l for l in text.splitlines() if l.strip()]
+    return "\n".join(lines[-n:])
+
+
+# --------------------------------------------------------------------------
+# board — the single source of work
+# --------------------------------------------------------------------------
+# Row: state \t id \t created \t origin \t pane \t title \t attempts
+# state: pending | taken | done | blocked
+
+def board_read(tsv):
+    if not os.path.exists(tsv):
+        return []
+    rows = []
+    with open(tsv, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            row = line.rstrip("\n").split("\t")
+            while len(row) < 7:
+                row.append("0" if len(row) == 6 else "-")
+            rows.append(row)
+    return rows
+
+
+def board_write(tsv, rows, before):
+    """temp file -> fsync -> os.replace, plus a .bak and a shrink guard.
+
+    `open(w)` truncates first and writes after: if the process dies in between
+    the board is gone. That is not hypothetical — it cost 379 items once.
+    """
+    if len(rows) < len(before):
+        sys.exit("latigo board: ABORTED, the operation would shrink the board "
+                 "(%d -> %d rows)" % (len(before), len(rows)))
+    if os.path.exists(tsv):
+        try:
+            with open(tsv, "rb") as src, open(tsv + ".bak", "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            pass
+    tmp = tsv + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write("\t".join(row) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, tsv)
+
+
+def cmd_board(root, argv):
+    base = home(root)
+    tsv = os.path.join(base, "board.tsv")
+    items = os.path.join(base, "items")
+    sub = argv[0] if argv else "list"
+    rest = argv[1:]
+
+    with Lock(os.path.join(base, ".board.lock")):
+        rows = board_read(tsv)
+        before = [list(r) for r in rows]
+
+        if sub == "add":
+            text = rest[0] if rest and not rest[0].startswith("--") else sys.stdin.read()
+            origin = rest[rest.index("--origin") + 1] if "--origin" in rest else "cli"
+            if not text.strip():
+                sys.exit("latigo board add: empty item")
+            n = 1 + max([int(r[1].rsplit("-", 1)[-1]) for r in rows
+                         if r[1].rsplit("-", 1)[-1].isdigit()] or [0])
+            ident = "IT-%03d" % n
+            with open(os.path.join(items, ident + ".md"), "w", encoding="utf-8") as fh:
+                fh.write(text if text.endswith("\n") else text + "\n")
+            title = text.strip().splitlines()[0][:110].lstrip("# ").replace("\t", " ")
+            rows.append(["pending", ident, str(int(time.time())), origin, "-", title, "0"])
+            board_write(tsv, rows, before)
+            print(ident)
+
+        elif sub == "take":
+            if not rest:
+                sys.exit("latigo board take: which pane?")
+            pane = rest[0]
+            # Do NOT hand out from the head of the queue. With a dozen panes
+            # asking for work the head becomes a meat grinder: the same item
+            # goes out again and again until it burns its attempts without
+            # anyone actually working it. Fewest attempts first, oldest to
+            # break ties, so the wear spreads and the whole queue gets read.
+            cands = []
+            for i, row in enumerate(rows):
+                if row[0] != "pending":
+                    continue
+                try:
+                    n = int(row[6] or 0)
+                except ValueError:
+                    n = 0
+                if n >= ATTEMPT_CAP:
+                    row[0], row[4] = "blocked", "-"
+                    continue
+                cands.append((n, i))
+            picked = None
+            if cands:
+                cands.sort()
+                picked = rows[cands[0][1]]
+                picked[0], picked[4] = "taken", pane
+                picked[6] = str(int(picked[6] or 0) + 1)
+            board_write(tsv, rows, before)
+            if picked:
+                print(picked[1])
+
+        elif sub in ("done", "release", "blocked"):
+            if not rest:
+                sys.exit("latigo board %s: which item?" % sub)
+            ident = rest[0]
+            new = {"done": "done", "release": "pending", "blocked": "blocked"}[sub]
+            hit = False
+            for row in rows:
+                if row[1] == ident:
+                    row[0] = new
+                    if new == "pending":
+                        row[4] = "-"
+                    hit = True
+            board_write(tsv, rows, before)
+            if not hit:
+                sys.exit("latigo board: no such item %s" % ident)
+            print("%s -> %s" % (ident, new))
+
+        elif sub == "pending":
+            print(sum(1 for r in rows if r[0] == "pending"))
+
+        elif sub == "show":
+            if not rest:
+                sys.exit("latigo board show: which item?")
+            path = os.path.join(items, rest[0] + ".md")
+            if not os.path.exists(path):
+                sys.exit("latigo board: no such item file %s" % path)
+            with open(path, encoding="utf-8") as fh:
+                sys.stdout.write(fh.read())
+
+        elif sub == "list":
+            n = int(rest[0]) if rest and rest[0].isdigit() else 40
+            for row in rows[-n:]:
+                print("%-8s %-8s try=%s %-10s %-8s %s"
+                      % (row[0], row[1], row[6], row[3][:10], row[4], row[5][:60]))
+            print("--- %d rows, %d pending ---"
+                  % (len(rows), sum(1 for r in rows if r[0] == "pending")))
+        else:
+            sys.exit("latigo board: unknown subcommand '%s'" % sub)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# fleet
+# --------------------------------------------------------------------------
+
+def workers(root, adopted, never):
+    """Idle panes that are workers OF THIS PROJECT.
+
+    Two filters, both learned the hard way:
+
+    - kind must be the worker kind (opencode). A `claude` pane is a
+      conversation — the owner's session or the supervisor — never a worker.
+      Whipping one interrupts a human mid-sentence and bills them for it.
+      This invariant survives panes being renumbered and roles renamed, which
+      is exactly how id-based and name-based exclusion lists rotted.
+    - cwd must be this project's root, or the pane must be adopted. Without
+      it you hand this repo's items to panes working on something else.
+    """
+    out = []
+    for a in agents():
+        if a.get("agent_status") not in ("idle", "done"):
+            continue
+        if a.get("agent") != WORKER_KIND:
+            continue
+        pane = a.get("pane_id", "")
+        if pane in never or (a.get("name") or "") in never:
+            continue
+        cwd = os.path.realpath(a.get("cwd") or "/dev/null")
+        if cwd != root and pane not in adopted:
+            continue
+        out.append((a.get("name") or pane, pane, cwd))
+    return out
+
+
+def cmd_roster(root, argv):
+    adopted = conf_list(os.path.join(home(root), "adopted-panes.conf"))
+    for a in agents():
+        pane = a.get("pane_id", "")
+        cwd = os.path.realpath(a.get("cwd") or "/")
+        mine = a.get("agent") == WORKER_KIND and (cwd == root or pane in adopted)
+        print("%-10s %-6s %-9s %-8s %-4s %s"
+              % (a.get("name") or "-", pane, a.get("agent"),
+                 a.get("agent_status"), "this" if mine else "-", cwd))
+    return 0
+
+
+def cmd_sweep(root, argv):
+    base = home(root)
+    dry = "--dry" in argv
+    grace = int(argv[argv.index("--grace") + 1]) if "--grace" in argv else GRACE
+    cooldown = int(argv[argv.index("--cooldown") + 1]) if "--cooldown" in argv else COOLDOWN
+    loop = "--loop" in argv
+    interval = INTERVAL
+    if loop:
+        i = argv.index("--loop")
+        if i + 1 < len(argv) and argv[i + 1].isdigit():
+            interval = int(argv[i + 1])
+
+    state_path = os.path.join(base, "sweep.state.json")
+    state = {}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except Exception:                                   # noqa: BLE001
+            state = {}
+
+    while True:
+        _sweep_once(root, base, state, dry, grace, cooldown)
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        if not loop:
+            return 0
+        time.sleep(interval)
+
+
+def _sweep_once(root, base, state, dry, grace, cooldown):
+    adopted = conf_list(os.path.join(base, "adopted-panes.conf"))
+    never = conf_list(os.path.join(base, "no-whip.conf"))
+    rules = ""
+    rules_path = os.path.join(base, "rules.md")
+    if os.path.exists(rules_path):
+        with open(rules_path, encoding="utf-8") as fh:
+            rules = "\n\nHOUSE RULES (from .latigo/rules.md):\n" + fh.read().strip()
+
+    free = workers(root, adopted, never)
+    _, pending_out, _ = sh([sys.argv[0], "board", "pending", "--dir", root])
+    pending = int(pending_out.strip() or 0)
+    now = time.time()
+    print("free:%d  pending:%d%s"
+          % (len(free), pending,
+             ("  (" + " ".join(n for n, _, _ in free) + ")") if free else ""))
+
+    # SILENCE valve. An empty board means there is nothing to hand out, and
+    # refilling it is the owner's call. A quiet worker with everything done is
+    # the correct state, not a fault to be corrected with messages.
+    if pending == 0:
+        if free and not state.get("_warned_empty"):
+            print("latigo: board empty and %d worker(s) free — leaving them alone. "
+                  "Add work with: latigo board add \"...\"" % len(free))
+            state["_warned_empty"] = True
+        return
+    state["_warned_empty"] = False
+
+    for name, pane, cwd in free:
+        st = state.setdefault(pane, {})
+
+        # GRACE valve. An agent between two tool calls reads as idle for a few
+        # seconds; talking to it there cuts its thread and you pay for the
+        # prompt anyway.
+        if not st.get("idle_since"):
+            st["idle_since"] = now
+            continue
+        if now - st["idle_since"] < grace:
+            continue
+
+        # COOLDOWN valve. Hard ceiling on spend per pane.
+        if now - st.get("last_whip", 0) < cooldown:
+            continue
+
+        if dry:
+            print("latigo (dry): would whip %s" % name)
+            continue
+
+        # Claim the item BEFORE naming it. Without an atomic claim a sweep
+        # that finds four idle panes tells all four to do the same ticket,
+        # and four panes colliding on one file is worse than four idle panes.
+        _, out, _ = sh([sys.argv[0], "board", "take", pane, "--dir", root])
+        ident = out.strip().splitlines()[-1] if out.strip() else ""
+        if not ident:
+            print("latigo: no item available for %s" % name)
+            continue
+
+        item_path = os.path.join(base, "items", ident + ".md")
+        title = ""
+        if os.path.exists(item_path):
+            with open(item_path, encoding="utf-8") as fh:
+                title = fh.readline().strip().lstrip("# ")
+
+        # An adopted pane's shell started somewhere else, so every relative
+        # path below would resolve against the wrong directory and fail
+        # silently. Prefix an absolute cd.
+        preamble = ("FIRST: cd %s   (your shell started elsewhere; everything "
+                    "below is relative to that directory)\n" % root) if cwd != root else ""
+
+        text = (
+            "%sAUTOMATIC WHIP: you are idle and did not report.\n"
+            "This item is claimed for you: %s\n"
+            "  %s\n"
+            "The full request is in %s — read it whole before touching anything.\n"
+            "When you close it, say in one line what you did and run:\n"
+            "  latigo board done %s --dir %s\n"
+            "then take the next one:\n"
+            "  latigo board take %s --dir %s\n"
+            "Never idle.%s" % (preamble, ident, title, item_path,
+                               ident, root, pane, root, rules))
+
+        ok, detail = send(pane, text)
+        if ok:
+            st["last_whip"] = now
+            st["idle_since"] = None
+            print("latigo: WHIP %s item=%s %s" % (name, ident, title[:50]))
+            with open(os.path.join(base, "latigo.log"), "a", encoding="utf-8") as fh:
+                fh.write("%s\tWHIP\t%s\t%s\t%s\n"
+                         % (time.strftime("%F %T"), pane, ident, title[:60]))
+        else:
+            # The pane never started: give the item back instead of leaving it
+            # reserved by a dead worker.
+            sh([sys.argv[0], "board", "release", ident, "--dir", root])
+            print("latigo: %s did not take it (%s) — item %s returned to the board"
+                  % (name, detail, ident), file=sys.stderr)
+
+
+def cmd_send(root, argv):
+    if len(argv) < 2:
+        sys.exit('usage: latigo send <agent> "<text>"')
+    ok, detail = send(argv[0], " ".join(argv[1:]))
+    print(("sent to %s (%s)" if ok else "NOT sent to %s (%s)") % (argv[0], detail))
+    return 0 if ok else 1
+
+
+def cmd_deploy(root, argv):
+    """Fill this project's empty shell panes with workers, and top up with new
+    tabs until the requested count is reached."""
+    want = int(argv[argv.index("-n") + 1]) if "-n" in argv else 0
+    kind = argv[argv.index("--kind") + 1] if "--kind" in argv else WORKER_KIND
+    prefix = argv[argv.index("--prefix") + 1] if "--prefix" in argv else "dev"
+    ws = os.environ.get("HERDR_WORKSPACE_ID", "w1")
+
+    existing = [a for a in agents() if a.get("agent") == kind]
+    used = set()
+    for a in existing:
+        n = (a.get("name") or "")
+        if n.startswith(prefix) and n[len(prefix):].isdigit():
+            used.add(int(n[len(prefix):]))
+    nxt = max(used) + 1 if used else 1
+
+    # Adopt unnamed workers first.
+    for a in existing:
+        if a.get("name"):
+            continue
+        name = "%s%d" % (prefix, nxt)
+        if sh(["herdr", "agent", "rename", a["pane_id"], name])[0] == 0:
+            print("%s <- %s (adopted)" % (name, a["pane_id"]))
+            nxt += 1
+
+    have = len([a for a in agents() if a.get("agent") == kind and a.get("name")])
+    while want and have < want:
+        name = "%s%d" % (prefix, nxt)
+        code, out, err = sh(["herdr", "tab", "create", "--workspace", ws,
+                             "--cwd", root, "--label", name, "--no-focus"])
+        try:
+            pane = json.loads(out)["result"]["root_pane"]["pane_id"]
+        except Exception:                                   # noqa: BLE001
+            print("latigo deploy: could not create a tab: %s" % (err or out), file=sys.stderr)
+            break
+        code, _, err = sh(["herdr", "agent", "start", name, "--kind", kind,
+                           "--pane", pane, "--timeout", "120000", "--", "--auto"],
+                          timeout=180)
+        if code != 0:
+            print("latigo deploy: could not start %s in %s: %s" % (kind, pane, err),
+                  file=sys.stderr)
+            break
+        print("%s <- %s (new tab)" % (name, pane))
+        nxt += 1
+        have += 1
+
+    return cmd_roster(root, [])
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    root = root_of(argv)
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd != "board" and os.environ.get("HERDR_ENV") != "1":
+        print("latigo: not inside a Herdr session (HERDR_ENV != 1)", file=sys.stderr)
+        return 3
+
+    table = {"sweep": cmd_sweep, "roster": cmd_roster, "send": cmd_send,
+             "board": cmd_board, "deploy": cmd_deploy}
+    if cmd not in table:
+        print("latigo: unknown command '%s' (try latigo --help)" % cmd, file=sys.stderr)
+        return 2
+    return table[cmd](root, rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
